@@ -1,0 +1,88 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# OpenTelemetry Collector Configuration
+#
+# The Collector acts as a vendor-agnostic telemetry proxy. Services send OTLP
+# data here, and the collector fans it out to multiple backends.
+#
+# Pipeline structure:
+#   receivers  →  processors  →  exporters
+#
+# Traces pipeline:  otlp → batch → [debug, otlp/jaeger]
+# Metrics pipeline: otlp → batch → [debug, prometheus]
+# ──────────────────────────────────────────────────────────────────────────────
+
+receivers:
+  # OTLP receiver accepts spans and metrics from all services.
+  # Services connect via gRPC (4317) or HTTP (4318).
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch processor buffers telemetry and sends in bulk.
+  # Reduces network calls and improves throughput.
+  batch:
+    timeout: 1s           # flush at least every second
+    send_batch_size: 512  # or when 512 items accumulate
+
+  # Memory limiter prevents OOM if load spikes unexpectedly.
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+
+exporters:
+  # ── Debug exporter ──────────────────────────────────────────────
+  # Logs telemetry to collector stdout. Useful during development.
+  # Set verbosity to "normal" or "basic" to reduce noise.
+  debug:
+    verbosity: normal
+
+  # ── Jaeger exporter via OTLP ────────────────────────────────────
+  # Jaeger ≥ 1.35 natively speaks OTLP gRPC. We use the standard
+  # OTLP exporter pointed at Jaeger's internal endpoint.
+  # The service name in each container is "jaeger" (Docker DNS).
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true  # no TLS in the internal Docker network
+
+  # ── Prometheus exporter ─────────────────────────────────────────
+  # Exposes an HTTP /metrics endpoint that Prometheus scrapes.
+  # Metrics received via OTLP are converted to Prometheus format.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    namespace: otelcol      # prefix added to all metric names
+    send_timestamps: true
+    metric_expiration: 3m
+
+extensions:
+  # Health check endpoint — used by Docker Compose healthcheck.
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # pprof lets you profile the collector itself.
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+service:
+  extensions: [health_check, pprof]
+
+  pipelines:
+    # ── Traces pipeline ───────────────────────────────────────────
+    # All trace data flows: services → collector → Jaeger
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug, otlp/jaeger]
+
+    # ── Metrics pipeline ──────────────────────────────────────────
+    # Metrics flow: services → collector → Prometheus (via pull)
+    # Prometheus is configured to scrape the collector's :8889 endpoint.
+    metrics:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:  [debug, prometheus]

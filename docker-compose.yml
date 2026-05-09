@@ -1,0 +1,158 @@
+version: "3.9"
+
+services:
+  # ─────────────────────────────────────────────────────────────────
+  # PostgreSQL — persistent store for orders (and seeded users)
+  # ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: otelpoc
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d otelpoc"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─────────────────────────────────────────────────────────────────
+  # Jaeger — trace storage and UI
+  # COLLECTOR_OTLP_ENABLED lets the collector push traces to Jaeger
+  # via OTLP gRPC on the internal Docker network (port 4317).
+  # Only the UI (16686) is exposed to the host.
+  # ─────────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - SPAN_STORAGE_TYPE=memory
+    ports:
+      - "16686:16686" # Jaeger UI
+      # 4317 is intentionally NOT exposed to the host to avoid conflict
+      # with the collector's port. The collector reaches Jaeger via the
+      # internal Docker network (jaeger:4317).
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ─────────────────────────────────────────────────────────────────
+  # OpenTelemetry Collector — the central telemetry hub
+  #
+  # Receives OTLP data from all services on port 4317, batches it,
+  # then fans out to:
+  #   • Jaeger      (traces)
+  #   • Prometheus  (metrics, via pull endpoint on 8889)
+  #   • debug/log   (traces + metrics, for easy inspection)
+  # ─────────────────────────────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.101.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./collector/config.yaml:/etc/otelcol-contrib/config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC receiver  (services → collector)
+      - "4318:4318" # OTLP HTTP receiver  (alternative protocol)
+      - "8889:8889" # Prometheus scrape endpoint (collector → Prometheus)
+    depends_on:
+      jaeger:
+        condition: service_started
+    # The otel-collector-contrib image is distroless (no shell/wget).
+    # We rely on a restart policy instead of a healthcheck; the OTLP gRPC
+    # client in each service will automatically reconnect if the collector
+    # starts a moment after the service process.
+    restart: on-failure
+
+  # ─────────────────────────────────────────────────────────────────
+  # Prometheus — metrics storage and query engine
+  # ─────────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  # ─────────────────────────────────────────────────────────────────
+  # Gateway Service — single public entry point
+  # Calls user-service and order-service, propagating trace context.
+  # ─────────────────────────────────────────────────────────────────
+  gateway-service:
+    build:
+      context: ./gateway-service
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SERVICE_NAME: gateway-service
+      SERVICE_PORT: "8080"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      USER_SERVICE_URL: http://user-service:8081
+      ORDER_SERVICE_URL: http://order-service:8082
+    depends_on:
+      otel-collector:
+        condition: service_started
+      user-service:
+        condition: service_started
+      order-service:
+        condition: service_started
+
+  # ─────────────────────────────────────────────────────────────────
+  # User Service — internal user lookup (in-memory store)
+  # ─────────────────────────────────────────────────────────────────
+  user-service:
+    build:
+      context: ./user-service
+      dockerfile: Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      SERVICE_NAME: user-service
+      SERVICE_PORT: "8081"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  # ─────────────────────────────────────────────────────────────────
+  # Order Service — creates orders in PostgreSQL
+  # Demonstrates DB instrumentation with manual OTel spans.
+  # ─────────────────────────────────────────────────────────────────
+  order-service:
+    build:
+      context: ./order-service
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      SERVICE_NAME: order-service
+      SERVICE_PORT: "8082"
+      OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: otelpoc
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    depends_on:
+      otel-collector:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
