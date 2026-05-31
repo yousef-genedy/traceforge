@@ -1,0 +1,75 @@
+{
+  "session_id": "session-2026-05-30-2130",
+  "started": "2026-05-30T18:30:02.826Z",
+  "files_read": {
+    "/Users/yousef/Projects/traceforge/docker-compose.yml": {
+      "count": 1,
+      "tokens": 2325,
+      "first_read": "2026-05-30T18:33:00.023Z"
+    },
+    "/Users/yousef/Projects/traceforge/docs/GUIDE.md": {
+      "count": 2,
+      "tokens": 10736,
+      "first_read": "2026-05-30T18:33:55.773Z"
+    },
+    "/Users/yousef/Projects/traceforge/README.md": {
+      "count": 1,
+      "tokens": 4800,
+      "first_read": "2026-05-31T03:44:57.701Z"
+    }
+  },
+  "files_written": [
+    {
+      "file": "/Users/yousef/Projects/traceforge/docker-compose.yml",
+      "action": "edit",
+      "tokens": 17,
+      "at": "2026-05-30T18:33:53.098Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/docs/GUIDE.md",
+      "action": "edit",
+      "tokens": 54,
+      "at": "2026-05-30T18:33:59.537Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/docs/GUIDE.md",
+      "action": "edit",
+      "tokens": 26,
+      "at": "2026-05-30T18:34:09.287Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/README.md",
+      "action": "create",
+      "tokens": 3448,
+      "at": "2026-05-30T18:35:16.767Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/README.md",
+      "action": "edit",
+      "tokens": 172,
+      "at": "2026-05-31T03:45:11.315Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/README.md",
+      "action": "edit",
+      "tokens": 403,
+      "at": "2026-05-31T03:45:23.708Z"
+    },
+    {
+      "file": "/Users/yousef/Projects/traceforge/README.md",
+      "action": "edit",
+      "tokens": 391,
+      "at": "2026-05-31T03:47:39.011Z"
+    }
+  ],
+  "edit_counts": {
+    "docker-compose.yml": 1,
+    "docs/GUIDE.md": 2,
+    "README.md": 4
+  },
+  "anatomy_hits": 3,
+  "anatomy_misses": 0,
+  "repeated_reads_warned": 1,
+  "cerebrum_warnings": 0,
+  "stop_count": 4
+}

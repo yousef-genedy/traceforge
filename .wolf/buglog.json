@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "bugs": [
+    {
+      "id": "bug-001",
+      "timestamp": "2026-05-28T13:14:50.730Z",
+      "error_message": "Significant refactor of ",
+      "file": "docker-compose.yml",
+      "root_cause": "2 lines replaced/restructured",
+      "fix": "Rewrote 27→51 lines (2 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "yml"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-28T13:14:50.730Z"
+    },
+    {
+      "id": "bug-002",
+      "timestamp": "2026-05-28T13:15:27.487Z",
+      "error_message": "Significant refactor of ",
+      "file": "grafana/provisioning/dashboards/traceforge-overview.json",
+      "root_cause": "3 lines replaced/restructured",
+      "fix": "Rewrote 9→9 lines (3 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "json"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-28T13:15:27.487Z"
+    },
+    {
+      "id": "bug-003",
+      "timestamp": "2026-05-28T00:00:00Z",
+      "error_message": "go mod tidy && CGO_ENABLED=0 ... returned a non-zero code: 1 during docker compose up --build",
+      "file": "gateway-service/Dockerfile, order-service/Dockerfile, user-service/Dockerfile",
+      "root_cause": "go.mod files had only 'module' + 'go' directives with no require block and no go.sum. Relying on 'go mod tidy' inside Docker to resolve all dependencies at build time fails when GOPROXY is unreachable or network is slow inside the build environment.",
+      "fix": "Ran 'go mod tidy' locally to generate go.mod (with full require blocks) and go.sum. Updated Dockerfiles to use 'COPY go.mod go.sum ./' + 'go mod download' pattern, removing the 'go mod tidy' call from the build step. Dependencies are now resolved from the committed go.sum.",
+      "tags": [
+        "docker",
+        "go-modules",
+        "build-failure",
+        "go-sum",
+        "dependency"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-28T00:00:00Z"
+    },
+    {
+      "id": "bug-004",
+      "timestamp": "2026-05-30T12:23:58.883Z",
+      "error_message": "Wrong reference: OpenSearch should be Loki",
+      "file": "gateway-service/main.go",
+      "root_cause": "Used \"OpenSearch\" instead of \"Loki\"",
+      "fix": "Changed OpenSearch → Loki",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "go"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-30T12:23:59.756Z"
+    },
+    {
+      "id": "bug-005",
+      "timestamp": "2026-05-30T12:24:04.720Z",
+      "error_message": "Wrong reference: OpenSearch should be Loki",
+      "file": "gateway-service/internal/telemetry/telemetry.go",
+      "root_cause": "Used \"OpenSearch\" instead of \"Loki\"",
+      "fix": "Changed OpenSearch → Loki",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "go"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-30T12:24:06.787Z"
+    },
+    {
+      "id": "bug-006",
+      "timestamp": "2026-05-30T12:24:16.800Z",
+      "error_message": "Wrong reference: OpenSearch should be Loki",
+      "file": "gateway-service/internal/logging/logging.go",
+      "root_cause": "Used \"OpenSearch\" instead of \"Loki\"",
+      "fix": "Changed OpenSearch → Loki",
+      "tags": [
+        "auto-detected",
+        "wrong-reference",
+        "go"
+      ],
+      "related_bugs": [],
+      "occurrences": 6,
+      "last_seen": "2026-05-30T12:24:43.496Z"
+    },
+    {
+      "id": "bug-007",
+      "timestamp": "2026-05-30T00:00:00Z",
+      "error_message": "github.com/ugorji/go/codec: signal: killed during go build in Docker",
+      "file": "gateway-service/Dockerfile, order-service/Dockerfile, user-service/Dockerfile",
+      "root_cause": "Docker Desktop OOM kill: Go compiler spawns multiple parallel compile jobs by default; ugorji/go/codec (transitive dep of gin) requires significant memory to compile. On Apple Silicon with low Docker memory limits the compiler process is killed by the OS.",
+      "fix": "Added -p 1 flag to all three go build commands in Dockerfiles to limit parallel compilation jobs, reducing peak memory usage at the cost of slower builds.",
+      "tags": [
+        "docker",
+        "oom",
+        "go-build",
+        "apple-silicon",
+        "compiler"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-30T00:00:00Z"
+    },
+    {
+      "id": "bug-008",
+      "timestamp": "2026-05-30T18:33:59.538Z",
+      "error_message": "Incorrect value in code",
+      "file": "docs/GUIDE.md",
+      "root_cause": "Had `init.sql`",
+      "fix": "Changed to `db/init.sql`",
+      "tags": [
+        "auto-detected",
+        "wrong-value",
+        "md"
+      ],
+      "related_bugs": [],
+      "occurrences": 2,
+      "last_seen": "2026-05-30T18:34:09.288Z"
+    },
+    {
+      "id": "bug-009",
+      "timestamp": "2026-05-31T03:47:39.012Z",
+      "error_message": "Significant refactor of ",
+      "file": "README.md",
+      "root_cause": "9 lines replaced/restructured",
+      "fix": "Rewrote 11→11 lines (9 removed)",
+      "tags": [
+        "auto-detected",
+        "refactor",
+        "md"
+      ],
+      "related_bugs": [],
+      "occurrences": 1,
+      "last_seen": "2026-05-31T03:47:39.012Z"
+    }
+  ]
+}
