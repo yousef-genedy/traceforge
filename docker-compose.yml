@@ -1,9 +1,16 @@
-version: "3.9"
+networks:
+  traceforge:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  loki_data:
+  grafana_data:
 
 services:
-  # ─────────────────────────────────────────────────────────────────
-  # PostgreSQL — persistent store for orders (and seeded users)
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — persistent store for orders and users
+  # ─────────────────────────────────────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     environment:
@@ -14,19 +21,20 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d otelpoc"]
       interval: 5s
       timeout: 5s
       retries: 10
+      start_period: 10s
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
-  # Jaeger — trace storage and UI
-  # COLLECTOR_OTLP_ENABLED lets the collector push traces to Jaeger
-  # via OTLP gRPC on the internal Docker network (port 4317).
-  # Only the UI (16686) is exposed to the host.
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Jaeger — distributed trace storage and UI
+  # Access the UI at http://localhost:16686
+  # ─────────────────────────────────────────────────────────────────────────────
   jaeger:
     image: jaegertracing/all-in-one:1.57
     environment:
@@ -34,46 +42,71 @@ services:
       - SPAN_STORAGE_TYPE=memory
     ports:
       - "16686:16686" # Jaeger UI
-      # 4317 is intentionally NOT exposed to the host to avoid conflict
-      # with the collector's port. The collector reaches Jaeger via the
-      # internal Docker network (jaeger:4317).
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ > /dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 5s
+      start_period: 10s
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
-  # OpenTelemetry Collector — the central telemetry hub
+  # ─────────────────────────────────────────────────────────────────────────────
+  # OpenTelemetry Collector — central telemetry gateway
   #
-  # Receives OTLP data from all services on port 4317, batches it,
-  # then fans out to:
-  #   • Jaeger      (traces)
-  #   • Prometheus  (metrics, via pull endpoint on 8889)
-  #   • debug/log   (traces + metrics, for easy inspection)
-  # ─────────────────────────────────────────────────────────────────
+  # Receives OTLP from all services on :4317 (gRPC) and :4318 (HTTP).
+  # Three separate pipelines:
+  #   traces  → Jaeger
+  #   metrics → Prometheus scrape endpoint (:8889)
+  #   logs    → Loki
+  # ─────────────────────────────────────────────────────────────────────────────
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:0.101.0
+    image: otel/opentelemetry-collector-contrib:0.104.0
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./collector/config.yaml:/etc/otelcol-contrib/config.yaml
     ports:
-      - "4317:4317" # OTLP gRPC receiver  (services → collector)
-      - "4318:4318" # OTLP HTTP receiver  (alternative protocol)
-      - "8889:8889" # Prometheus scrape endpoint (collector → Prometheus)
+      - "4317:4317" # OTLP gRPC (services → collector)
+      - "4318:4318" # OTLP HTTP (alternative protocol)
+      - "8889:8889" # Prometheus scrape endpoint
+      - "13133:13133" # Health check endpoint
     depends_on:
       jaeger:
-        condition: service_started
-    # The otel-collector-contrib image is distroless (no shell/wget).
-    # We rely on a restart policy instead of a healthcheck; the OTLP gRPC
-    # client in each service will automatically reconnect if the collector
-    # starts a moment after the service process.
+        condition: service_healthy
+      loki:
+        condition: service_healthy
     restart: on-failure
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
-  # Prometheus — metrics storage and query engine
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Loki — log aggregation backend
+  #
+  # Receives structured logs from the OTel Collector via HTTP push API (:3100).
+  # Each log record carries trace_id and span_id, enabling click-through to Jaeger.
+  # Access logs through Grafana Explore: http://localhost:3000/explore
+  # ─────────────────────────────────────────────────────────────────────────────
+  loki:
+    image: grafana/loki:3.1.0
+    command: -config.file=/etc/loki/config.yaml
+    volumes:
+      - ./loki/config.yaml:/etc/loki/config.yaml
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - traceforge
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Prometheus — metrics scrape, storage, and query engine
+  # Access the UI at http://localhost:9090
+  # ─────────────────────────────────────────────────────────────────────────────
   prometheus:
     image: prom/prometheus:v2.52.0
     volumes:
@@ -83,15 +116,57 @@ services:
     command:
       - "--config.file=/etc/prometheus/prometheus.yml"
       - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=7d"
       - "--web.enable-lifecycle"
     depends_on:
       otel-collector:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Grafana — dashboards and visualisation
+  # Access the UI at http://localhost:3000  (admin / admin)
+  #
+  # Pre-provisioned datasources: Prometheus, Jaeger
+  # Pre-provisioned dashboards:  TraceForge — Platform Overview
+  # ─────────────────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.0
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+      - GF_LOG_LEVEL=warn
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - traceforge
+
+  # ─────────────────────────────────────────────────────────────────────────────
   # Gateway Service — single public entry point
   # Calls user-service and order-service, propagating trace context.
-  # ─────────────────────────────────────────────────────────────────
+  # Access at http://localhost:8080
+  # ─────────────────────────────────────────────────────────────────────────────
   gateway-service:
     build:
       context: ./gateway-service
@@ -108,13 +183,22 @@ services:
       otel-collector:
         condition: service_started
       user-service:
-        condition: service_started
+        condition: service_healthy
       order-service:
-        condition: service_started
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
   # User Service — internal user lookup (in-memory store)
-  # ─────────────────────────────────────────────────────────────────
+  # Not exposed publicly — only the gateway reaches it.
+  # ─────────────────────────────────────────────────────────────────────────────
   user-service:
     build:
       context: ./user-service
@@ -128,11 +212,19 @@ services:
     depends_on:
       otel-collector:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - traceforge
 
-  # ─────────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────────
   # Order Service — creates orders in PostgreSQL
-  # Demonstrates DB instrumentation with manual OTel spans.
-  # ─────────────────────────────────────────────────────────────────
+  # Demonstrates DB instrumentation with OTel spans.
+  # ─────────────────────────────────────────────────────────────────────────────
   order-service:
     build:
       context: ./order-service
@@ -153,6 +245,11 @@ services:
         condition: service_started
       postgres:
         condition: service_healthy
-
-volumes:
-  postgres_data:
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - traceforge

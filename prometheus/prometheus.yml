@@ -1,10 +1,11 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Prometheus Configuration
+# Prometheus Configuration — TraceForge
 #
-# Prometheus pulls (scrapes) metrics from HTTP endpoints every 15 seconds.
-# We configure three scrape targets:
-#   1. Each Go service's /metrics endpoint (exposed by the OTel prometheus exporter)
-#   2. The OTel Collector's prometheus exporter (port 8889) for collector-level metrics
+# Prometheus uses a pull model: it scrapes HTTP /metrics endpoints on a schedule.
+# Each Go service exposes its OTel metrics at /metrics via the OTel prometheus
+# exporter (registered with the default prometheus registry).
+#
+# Grafana queries Prometheus for dashboards via the configured datasource.
 # ──────────────────────────────────────────────────────────────────────────────
 
 global:
@@ -12,45 +13,44 @@ global:
   evaluation_interval: 15s
   scrape_timeout:      10s
 
-  # Labels added to all time series scraped from this Prometheus instance.
   external_labels:
     environment: development
-    project: otel-poc
+    project: traceforge
 
 scrape_configs:
-  # ── Gateway Service ────────────────────────────────────────────────────────
-  # The Go OTel prometheus exporter registers metrics with the default
-  # prometheus registry. promhttp.Handler() exposes them at /metrics.
+  # ── Gateway Service ──────────────────────────────────────────────────────────
   - job_name: "gateway-service"
     static_configs:
       - targets: ["gateway-service:8080"]
     metrics_path: /metrics
     scrape_interval: 10s
 
-  # ── User Service ───────────────────────────────────────────────────────────
+  # ── User Service ─────────────────────────────────────────────────────────────
   - job_name: "user-service"
     static_configs:
       - targets: ["user-service:8081"]
     metrics_path: /metrics
     scrape_interval: 10s
 
-  # ── Order Service ──────────────────────────────────────────────────────────
+  # ── Order Service ────────────────────────────────────────────────────────────
   - job_name: "order-service"
     static_configs:
       - targets: ["order-service:8082"]
     metrics_path: /metrics
     scrape_interval: 10s
 
-  # ── OpenTelemetry Collector ────────────────────────────────────────────────
-  # The collector's prometheus exporter exposes metrics received via OTLP
-  # plus the collector's own internal metrics (spans received, export errors…).
+  # ── OTel Collector ───────────────────────────────────────────────────────────
+  # Exposes metrics received via OTLP plus the collector's own internal metrics
+  # (spans received, export errors, memory usage, etc.).
+  # The "otelcol_" prefix is set by namespace: otelcol in collector config.
   - job_name: "otel-collector"
     static_configs:
       - targets: ["otel-collector:8889"]
     metrics_path: /metrics
     scrape_interval: 10s
 
-  # ── Prometheus itself ──────────────────────────────────────────────────────
+  # ── Prometheus self-monitoring ───────────────────────────────────────────────
   - job_name: "prometheus"
     static_configs:
       - targets: ["localhost:9090"]
+    scrape_interval: 30s

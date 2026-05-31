@@ -1,0 +1,58 @@
+apiVersion: 1
+
+datasources:
+  # ── Prometheus ──────────────────────────────────────────────────────────────
+  # Primary metrics datasource. Scrapes all service /metrics endpoints and
+  # the OTel Collector's :8889 endpoint.
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: "15s"
+
+  # ── Loki ────────────────────────────────────────────────────────────────────
+  # Log aggregation datasource. Query logs in Grafana Explore using LogQL.
+  # Derived fields extract trace_id from JSON log lines and link to Jaeger,
+  # enabling one-click navigation from a log line to the full trace waterfall.
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      derivedFields:
+        # Extract trace_id from JSON log lines and make it a clickable link
+        # to Jaeger. Our services emit: {"trace_id":"<32-hex-chars>",...}
+        - name: TraceID
+          matcherRegex: '"trace_id":"([a-f0-9]{32})"'
+          url: '${__value.raw}'
+          datasourceUid: jaeger
+          urlDisplayLabel: 'View in Jaeger'
+
+  # ── Jaeger ─────────────────────────────────────────────────────────────────
+  # Distributed trace backend. Click a trace in Explore to open the waterfall.
+  # tracesToLogsV2 wires up Jaeger → Loki: clicking "Logs" on a span opens
+  # Grafana Explore pre-filtered to that service's logs containing the trace ID.
+  - name: Jaeger
+    type: jaeger
+    uid: jaeger
+    access: proxy
+    url: http://jaeger:16686
+    editable: false
+    jsonData:
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: "-1m"
+        spanEndTimeShift: "1m"
+        filterByTraceID: true
+        filterBySpanID: false
+        customQuery: true
+        # LogQL: filter to the service that produced the span, then search
+        # for the trace ID in the log body.
+        query: '{job="${__span.tags["service.name"]}"} |= `${__trace.traceId}`'

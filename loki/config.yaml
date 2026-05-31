@@ -1,0 +1,61 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Loki Configuration — TraceForge
+#
+# Single-binary, filesystem-backed Loki for local development.
+# Receives logs from the OTel Collector via the Loki HTTP push API (:3100).
+# Grafana queries Loki for log exploration and trace-to-log correlation.
+# ──────────────────────────────────────────────────────────────────────────────
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+# common block configures shared defaults for single-binary mode.
+# All components share one ring (in-memory) and one filesystem path.
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+# Schema v13 + tsdb: the recommended index format for Loki 3.x.
+schema_config:
+  configs:
+    - from: 2020-10-24
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+# Query result cache (in-process) keeps repeated range queries fast.
+query_range:
+  results_cache:
+    cache:
+      embedded_cache:
+        enabled: true
+        max_size_mb: 100
+
+limits_config:
+  # Reject samples older than 1 week to avoid backfill issues.
+  reject_old_samples: true
+  reject_old_samples_max_age: 168h
+  # Generous ingestion limits for local development bursts.
+  ingestion_rate_mb: 16
+  ingestion_burst_size_mb: 32
+  # Allow out-of-order writes within a 30s window (useful when
+  # services restart and replay buffered log records).
+  unordered_writes: true
+
+compactor:
+  compaction_interval: 5m

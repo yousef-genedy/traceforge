@@ -1,19 +1,22 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# OpenTelemetry Collector Configuration
+# OpenTelemetry Collector — TraceForge Configuration
 #
-# The Collector acts as a vendor-agnostic telemetry proxy. Services send OTLP
-# data here, and the collector fans it out to multiple backends.
+# The Collector is the central telemetry gateway. Services send all three
+# signal types (traces, metrics, logs) here via OTLP, and the Collector
+# fans them out to the appropriate backend.
 #
-# Pipeline structure:
-#   receivers  →  processors  →  exporters
+# Signal → Backend mapping:
+#   traces  → Jaeger      (via OTLP gRPC)
+#   metrics → Prometheus  (via scrape endpoint on :8889)
+#   logs    → Loki        (via Loki HTTP push API)
 #
-# Traces pipeline:  otlp → batch → [debug, otlp/jaeger]
-# Metrics pipeline: otlp → batch → [debug, prometheus]
+# Pipeline structure:  receivers → processors → exporters
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── Receivers ─────────────────────────────────────────────────────────────────
+# OTLP receiver accepts all three signal types from all services.
+# Services connect via gRPC (4317) or HTTP (4318).
 receivers:
-  # OTLP receiver accepts spans and metrics from all services.
-  # Services connect via gRPC (4317) or HTTP (4318).
   otlp:
     protocols:
       grpc:
@@ -21,68 +24,111 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
 
+# ── Processors ────────────────────────────────────────────────────────────────
 processors:
-  # Batch processor buffers telemetry and sends in bulk.
-  # Reduces network calls and improves throughput.
-  batch:
-    timeout: 1s           # flush at least every second
-    send_batch_size: 512  # or when 512 items accumulate
-
-  # Memory limiter prevents OOM if load spikes unexpectedly.
+  # Memory limiter — prevents OOM under traffic spikes.
+  # Must be the first processor in every pipeline.
   memory_limiter:
     check_interval: 1s
-    limit_mib: 256
-    spike_limit_mib: 64
+    limit_mib: 512
+    spike_limit_mib: 128
 
+  # Batch processor — buffers telemetry and flushes in bulk.
+  # Reduces network round-trips and backend write amplification.
+  batch:
+    timeout: 2s
+    send_batch_size: 1024
+    send_batch_max_size: 2048
+
+  # Resource processor — stamps every telemetry item with project-level
+  # attributes that are not set per-service (e.g. environment, stack name).
+  resource:
+    attributes:
+      - action: insert
+        key: deployment.environment
+        value: development
+      - action: insert
+        key: project
+        value: traceforge
+      - action: insert
+        key: collector.version
+        value: "0.104.0"
+
+# ── Exporters ─────────────────────────────────────────────────────────────────
 exporters:
-  # ── Debug exporter ──────────────────────────────────────────────
-  # Logs telemetry to collector stdout. Useful during development.
-  # Set verbosity to "normal" or "basic" to reduce noise.
+  # Debug — logs a summary of each received telemetry item to collector stdout.
+  # Set verbosity to "detailed" for full attribute dumps during development.
   debug:
-    verbosity: normal
+    verbosity: basic
 
-  # ── Jaeger exporter via OTLP ────────────────────────────────────
-  # Jaeger ≥ 1.35 natively speaks OTLP gRPC. We use the standard
-  # OTLP exporter pointed at Jaeger's internal endpoint.
-  # The service name in each container is "jaeger" (Docker DNS).
+  # Jaeger — receives traces via OTLP gRPC. Jaeger ≥ 1.35 speaks OTLP natively.
+  # "jaeger" resolves to the jaeger container via Docker's internal DNS.
   otlp/jaeger:
     endpoint: jaeger:4317
     tls:
-      insecure: true  # no TLS in the internal Docker network
+      insecure: true
 
-  # ── Prometheus exporter ─────────────────────────────────────────
-  # Exposes an HTTP /metrics endpoint that Prometheus scrapes.
-  # Metrics received via OTLP are converted to Prometheus format.
+  # Prometheus — exposes received metrics as a scrape endpoint at :8889.
+  # Prometheus is configured to scrape this endpoint every 10 s.
   prometheus:
     endpoint: 0.0.0.0:8889
-    namespace: otelcol      # prefix added to all metric names
+    namespace: otelcol
     send_timestamps: true
-    metric_expiration: 3m
+    metric_expiration: 5m
 
+  # Loki — receives structured log records via the HTTP push API.
+  # The job label is derived from service.name (OTel convention), so every
+  # service's logs are queryable in Grafana Explore as {job="<service-name>"}.
+  # Each log line carries trace_id and span_id for click-through to Jaeger.
+  loki:
+    endpoint: http://loki:3100/loki/api/v1/push
+    default_labels_enabled:
+      exporter: false   # omit "exporter=otlp" label (low-value cardinality)
+      job: true         # maps service.name → job label (standard Loki label)
+      instance: false   # omit instance label (single-node dev setup)
+      level: true       # maps log severity → level label for severity filtering
+
+# ── Extensions ────────────────────────────────────────────────────────────────
 extensions:
-  # Health check endpoint — used by Docker Compose healthcheck.
+  # Health check endpoint — returns 200 when the collector is ready.
   health_check:
     endpoint: 0.0.0.0:13133
 
-  # pprof lets you profile the collector itself.
+  # pprof — allows CPU/heap profiling of the collector process.
   pprof:
     endpoint: 0.0.0.0:1777
 
+# ── Service ───────────────────────────────────────────────────────────────────
 service:
   extensions: [health_check, pprof]
 
   pipelines:
-    # ── Traces pipeline ───────────────────────────────────────────
-    # All trace data flows: services → collector → Jaeger
+    # ── Traces ──────────────────────────────────────────────────────────────
+    # Flow: services → [OTLP:4317] → memory_limiter → resource → batch → Jaeger
     traces:
-      receivers:  [otlp]
-      processors: [memory_limiter, batch]
-      exporters:  [debug, otlp/jaeger]
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, otlp/jaeger]
 
-    # ── Metrics pipeline ──────────────────────────────────────────
-    # Metrics flow: services → collector → Prometheus (via pull)
-    # Prometheus is configured to scrape the collector's :8889 endpoint.
+    # ── Metrics ─────────────────────────────────────────────────────────────
+    # Flow: services → [OTLP:4317] → memory_limiter → resource → batch → prometheus
+    # Prometheus scrapes the :8889 endpoint. Grafana queries Prometheus.
     metrics:
-      receivers:  [otlp]
-      processors: [memory_limiter, batch]
-      exporters:  [debug, prometheus]
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, prometheus]
+
+    # ── Logs ────────────────────────────────────────────────────────────────
+    # Flow: services → [OTLP:4317] → memory_limiter → resource → batch → Loki
+    # Each log record carries trace_id and span_id for correlation with traces.
+    # In Grafana Explore, filter by {job="service-name"} or search by trace_id.
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [debug, loki]
+
+  telemetry:
+    logs:
+      level: warn
+    metrics:
+      address: 0.0.0.0:8888
