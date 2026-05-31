@@ -1,5 +1,5 @@
 // user-service serves internal user lookup requests.
-// It is not exposed publicly — only the gateway calls it.
+// Not exposed publicly — only the gateway calls it.
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"user-service/handlers"
+	"user-service/internal/logging"
 	"user-service/internal/telemetry"
 )
 
@@ -35,6 +36,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	slog.SetDefault(logging.NewLogger(serviceName))
+	slog.Info("telemetry initialised", "service", serviceName)
+
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -44,6 +48,7 @@ func main() {
 
 	r.GET("/health", h.Health)
 	r.GET("/internal/users/:id", h.GetUser)
+	r.GET("/internal/users", h.ListUsers)
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	srv := &http.Server{
@@ -51,6 +56,7 @@ func main() {
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {

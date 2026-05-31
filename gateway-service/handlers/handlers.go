@@ -1,19 +1,21 @@
 // Package handlers implements the gateway HTTP handlers.
 //
-// # Distributed Tracing in the Gateway
+// # Trace Propagation
 //
-// Every incoming request is already wrapped in a span by otelgin middleware.
-// Handler code obtains the active span's context via c.Request.Context().
-// Child spans are created with tracer.Start(ctx, "span-name"), which
-// automatically parents them to the current span in ctx.
+// Every inbound request is already wrapped in a server span by otelgin.
+// Child spans are created with tracer.Start(ctx, …). When calling downstream
+// services, http.NewRequestWithContext(ctx, …) binds the span context, and
+// otelhttp.Transport injects it as a "traceparent" header. The downstream
+// service's otelgin extracts the header and creates a child span — producing
+// one trace tree spanning all three processes, visible in Jaeger.
 //
-// When the gateway calls user-service or order-service:
-//   - http.NewRequestWithContext(ctx, …) binds the span context to the request
-//   - otelhttp.Transport injects that context as "traceparent" HTTP headers
-//   - The downstream service's otelgin extracts it and creates a child span
+// # Logs ↔ Traces Correlation
 //
-// Result: one trace ID spans all three services, visible as a single tree
-// in Jaeger.
+// Every slog.XxxContext(ctx, …) call goes through the logging.NewLogger handler.
+// When ctx contains an active span (which it does inside any handler after
+// tracer.Start), the handler injects trace_id and span_id into the log record.
+// The same IDs appear in Jaeger's span detail. In Grafana Explore (Loki),
+// filter by trace_id to see all logs for a single request.
 package handlers
 
 import (
@@ -35,8 +37,6 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
-// tracer is a package-level singleton. The name ("gateway-service") shows up
-// as the instrumentation library name in Jaeger, separate from the span name.
 var tracer = otel.Tracer("gateway-service")
 
 // Handler holds shared state for all route handlers.
@@ -45,12 +45,12 @@ type Handler struct {
 	orderServiceURL string
 	httpClient      *http.Client
 
-	// Custom metrics — these appear in Prometheus / Jaeger metrics view.
-	requestsTotal  metric.Int64Counter
-	upstreamErrors metric.Int64Counter
+	requestsTotal    metric.Int64Counter
+	requestDuration  metric.Float64Histogram
+	upstreamErrors   metric.Int64Counter
 }
 
-// New constructs a Handler and initialises its OTel instruments.
+// New constructs a Handler and initialises its OTel metric instruments.
 func New(userServiceURL, orderServiceURL string) *Handler {
 	meter := otel.Meter("gateway-service")
 
@@ -58,6 +58,12 @@ func New(userServiceURL, orderServiceURL string) *Handler {
 		"gateway.requests.total",
 		metric.WithDescription("Total HTTP requests handled by the gateway"),
 		metric.WithUnit("{request}"),
+	)
+
+	reqDuration, _ := meter.Float64Histogram(
+		"gateway.request.duration_ms",
+		metric.WithDescription("Gateway request processing latency in milliseconds"),
+		metric.WithUnit("ms"),
 	)
 
 	upstreamErr, _ := meter.Int64Counter(
@@ -69,38 +75,39 @@ func New(userServiceURL, orderServiceURL string) *Handler {
 	return &Handler{
 		userServiceURL:  userServiceURL,
 		orderServiceURL: orderServiceURL,
-		// otelhttp.NewTransport wraps the default transport so that every
-		// outbound request automatically carries "traceparent" headers.
+		// otelhttp.NewTransport injects "traceparent" into every outbound request.
 		httpClient: &http.Client{
 			Transport: otelhttp.NewTransport(http.DefaultTransport),
-			Timeout:   15 * time.Second,
+			Timeout:   20 * time.Second,
 		},
-		requestsTotal:  reqTotal,
-		upstreamErrors: upstreamErr,
+		requestsTotal:   reqTotal,
+		requestDuration: reqDuration,
+		upstreamErrors:  upstreamErr,
 	}
 }
 
-// Health is a simple liveness probe — no tracing needed.
+// Health is a liveness probe.
 func (h *Handler) Health(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"status":  "ok",
 		"service": "gateway-service",
+		"version": "2.0.0",
 	})
 }
 
 // GetUser handles GET /users/:id.
-// It fans out to user-service and returns the user record.
-// If id == "999" a simulated error span is produced.
+// Demonstrates error spans (id=999), business logic spans, and upstream calls.
 func (h *Handler) GetUser(c *gin.Context) {
+	start := time.Now()
 	userID := c.Param("id")
+	ctx := c.Request.Context()
 
-	// Create a child span beneath the otelgin root span.
-	// SpanKind=Server because this is a server-side handler span.
-	ctx, span := tracer.Start(c.Request.Context(), "gateway.get_user",
+	ctx, span := tracer.Start(ctx, "gateway.get_user",
 		trace.WithSpanKind(trace.SpanKindInternal),
 		trace.WithAttributes(
 			attribute.String("user.id", userID),
 			attribute.String("http.route", "/users/:id"),
+			attribute.String("http.method", "GET"),
 		),
 	)
 	defer span.End()
@@ -110,13 +117,16 @@ func (h *Handler) GetUser(c *gin.Context) {
 		attribute.String("method", "GET"),
 	))
 
-	// Simulated error path — user ID "999" always fails.
-	// This demonstrates error spans in Jaeger (shown in red).
+	// Simulated error: user 999 always returns not-found.
 	if userID == "999" {
-		err := fmt.Errorf("user %s not found (simulated error)", userID)
-		span.RecordError(err)
-		span.SetStatus(codes.Error, err.Error())
-		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("service", "gateway")))
+		err := fmt.Errorf("user %s not found (simulated)", userID)
+		span.RecordError(err, trace.WithAttributes(attribute.String("error.type", "UserNotFound")))
+		span.SetStatus(codes.Error, "user not found")
+		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("upstream", "gateway")))
+		slog.WarnContext(ctx, "user not found (simulated error path)",
+			"user_id", userID,
+		)
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "not_found")))
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
@@ -125,28 +135,43 @@ func (h *Handler) GetUser(c *gin.Context) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "upstream user-service call failed")
-		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("service", "user-service")))
+		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("upstream", "user-service")))
 		slog.ErrorContext(ctx, "user-service call failed", "error", err, "user_id", userID)
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "upstream_error")))
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch user"})
 		return
 	}
 
-	// Enrich span with the returned user data.
 	if name, ok := user["name"].(string); ok {
 		span.SetAttributes(attribute.String("user.name", name))
 	}
+	if tier, ok := user["tier"].(string); ok {
+		span.SetAttributes(attribute.String("user.tier", tier))
+	}
 
+	slog.InfoContext(ctx, "user fetched", "user_id", userID)
+	h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "ok")))
 	c.JSON(http.StatusOK, user)
 }
 
 // CreateOrder handles POST /orders.
-// Body: {"user_id": 1, "product_name": "widget", "amount": 29.99}
-// It calls order-service which writes to PostgreSQL.
-// Use product_name "slow-product" to trigger the slow-query simulation.
+// Body: {"user_id":1,"product_name":"widget","amount":29.99}
+//
+// Demo scenarios:
+//   - product_name "slow-product"  → triggers 600 ms DB slow-query simulation
+//   - product_name "out-of-stock"  → triggers inventory error span
+//   - amount > 1000.00             → triggers payment declined span
+//   - user_id 999                  → user validation fails (user not found)
 func (h *Handler) CreateOrder(c *gin.Context) {
-	ctx, span := tracer.Start(c.Request.Context(), "gateway.create_order",
+	start := time.Now()
+	ctx := c.Request.Context()
+
+	ctx, span := tracer.Start(ctx, "gateway.create_order",
 		trace.WithSpanKind(trace.SpanKindInternal),
-		trace.WithAttributes(attribute.String("http.route", "/orders")),
+		trace.WithAttributes(
+			attribute.String("http.route", "/orders"),
+			attribute.String("http.method", "POST"),
+		),
 	)
 	defer span.End()
 
@@ -163,24 +188,22 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 		return
 	}
 
-	// Annotate the span with business-relevant attributes.
-	if uid, ok := body["user_id"]; ok {
-		span.SetAttributes(attribute.String("order.user_id", fmt.Sprintf("%v", uid)))
-	}
+	userID := fmt.Sprintf("%v", body["user_id"])
 	if amt, ok := body["amount"].(float64); ok {
 		span.SetAttributes(attribute.Float64("order.amount", amt))
 	}
 	if pn, ok := body["product_name"].(string); ok {
 		span.SetAttributes(attribute.String("order.product_name", pn))
 	}
+	span.SetAttributes(attribute.String("order.user_id", userID))
 
-	// Business logic span: validate that the user exists before creating order.
-	// This creates an additional child span to show "business logic" wrapping.
-	userID := fmt.Sprintf("%v", body["user_id"])
+	// Validate user exists before forwarding.
 	if err := h.validateUser(ctx, userID); err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "user validation failed")
-		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("service", "user-service")))
+		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("upstream", "user-service")))
+		slog.WarnContext(ctx, "order rejected: invalid user", "user_id", userID, "error", err)
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "invalid_user")))
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid user: %v", err)})
 		return
 	}
@@ -189,21 +212,90 @@ func (h *Handler) CreateOrder(c *gin.Context) {
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, "upstream order-service call failed")
-		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("service", "order-service")))
-		slog.ErrorContext(ctx, "order-service call failed", "error", err)
+		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("upstream", "order-service")))
+		slog.ErrorContext(ctx, "order-service call failed", "error", err, "user_id", userID)
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "upstream_error")))
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to create order"})
 		return
 	}
 
-	span.AddEvent("order created successfully", trace.WithAttributes(
-		attribute.String("order.id", fmt.Sprintf("%v", order["id"])),
+	orderID := fmt.Sprintf("%v", order["id"])
+	span.AddEvent("order created", trace.WithAttributes(
+		attribute.String("order.id", orderID),
+		attribute.String("order.status", fmt.Sprintf("%v", order["status"])),
 	))
 
+	slog.InfoContext(ctx, "order created successfully",
+		"order_id", orderID,
+		"user_id", userID,
+	)
+	h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "ok")))
 	c.JSON(http.StatusCreated, order)
 }
 
-// validateUser is a "business logic span" wrapping a call to user-service.
-// It demonstrates how you can wrap arbitrary logic in a named span.
+// GetOrdersByUser handles GET /orders?user_id=1.
+func (h *Handler) GetOrdersByUser(c *gin.Context) {
+	start := time.Now()
+	ctx := c.Request.Context()
+	userID := c.Query("user_id")
+
+	ctx, span := tracer.Start(ctx, "gateway.get_orders_by_user",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("http.route", "/orders"),
+			attribute.String("http.method", "GET"),
+			attribute.String("query.user_id", userID),
+		),
+	)
+	defer span.End()
+
+	h.requestsTotal.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("endpoint", "/orders"),
+		attribute.String("method", "GET"),
+	))
+
+	if userID == "" {
+		span.SetStatus(codes.Error, "missing user_id query param")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "user_id query param required"})
+		return
+	}
+
+	url := fmt.Sprintf("%s/internal/orders?user_id=%s", h.orderServiceURL, userID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "failed to build request")
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "error")))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "order-service call failed")
+		h.upstreamErrors.Add(ctx, 1, metric.WithAttributes(attribute.String("upstream", "order-service")))
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "upstream_error")))
+		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to fetch orders"})
+		return
+	}
+	defer resp.Body.Close()
+
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		span.RecordError(err)
+		h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "read_error")))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to read response"})
+		return
+	}
+
+	h.requestDuration.Record(ctx, ms(start), metric.WithAttributes(attribute.String("result", "ok")))
+	c.Data(resp.StatusCode, "application/json", data)
+}
+
+// validateUser calls user-service to confirm the user exists.
 func (h *Handler) validateUser(ctx context.Context, userID string) error {
 	ctx, span := tracer.Start(ctx, "gateway.validate_user",
 		trace.WithAttributes(attribute.String("user.id", userID)),
@@ -213,7 +305,7 @@ func (h *Handler) validateUser(ctx context.Context, userID string) error {
 	_, err := h.callUserService(ctx, userID)
 	if err != nil {
 		span.RecordError(err)
-		span.SetStatus(codes.Error, "user not found or unavailable")
+		span.SetStatus(codes.Error, "user not found or service unavailable")
 		return err
 	}
 	span.AddEvent("user validated")
@@ -221,20 +313,20 @@ func (h *Handler) validateUser(ctx context.Context, userID string) error {
 }
 
 // callUserService makes an instrumented HTTP GET to user-service.
-// otelhttp.Transport (set on h.httpClient) automatically injects
-// the traceparent header so user-service continues the same trace.
 func (h *Handler) callUserService(ctx context.Context, userID string) (map[string]any, error) {
-	ctx, span := tracer.Start(ctx, "http.client.user-service.get_user",
+	url := fmt.Sprintf("%s/internal/users/%s", h.userServiceURL, userID)
+
+	ctx, span := tracer.Start(ctx, "http.client GET user-service /internal/users/:id",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
 			attribute.String("http.method", "GET"),
-			attribute.String("http.url", h.userServiceURL+"/internal/users/"+userID),
+			attribute.String("http.url", url),
 			attribute.String("peer.service", "user-service"),
+			attribute.String("user.id", userID),
 		),
 	)
 	defer span.End()
 
-	url := fmt.Sprintf("%s/internal/users/%s", h.userServiceURL, userID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -248,12 +340,10 @@ func (h *Handler) callUserService(ctx context.Context, userID string) (map[strin
 	}
 	defer resp.Body.Close()
 
-	span.SetAttributes(
-		attribute.Int("http.status_code", resp.StatusCode),
-	)
+	span.SetAttributes(attribute.Int("http.status_code", resp.StatusCode))
 
 	if resp.StatusCode != http.StatusOK {
-		span.SetStatus(codes.Error, "non-200 response from user-service")
+		span.SetStatus(codes.Error, fmt.Sprintf("user-service returned HTTP %d", resp.StatusCode))
 		return nil, fmt.Errorf("user-service returned HTTP %d", resp.StatusCode)
 	}
 
@@ -271,11 +361,13 @@ func (h *Handler) callUserService(ctx context.Context, userID string) (map[strin
 
 // callOrderService makes an instrumented HTTP POST to order-service.
 func (h *Handler) callOrderService(ctx context.Context, body map[string]any) (map[string]any, error) {
-	ctx, span := tracer.Start(ctx, "http.client.order-service.create_order",
+	url := h.orderServiceURL + "/internal/orders"
+
+	ctx, span := tracer.Start(ctx, "http.client POST order-service /internal/orders",
 		trace.WithSpanKind(trace.SpanKindClient),
 		trace.WithAttributes(
 			attribute.String("http.method", "POST"),
-			attribute.String("http.url", h.orderServiceURL+"/internal/orders"),
+			attribute.String("http.url", url),
 			attribute.String("peer.service", "order-service"),
 		),
 	)
@@ -286,10 +378,7 @@ func (h *Handler) callOrderService(ctx context.Context, body map[string]any) (ma
 		return nil, fmt.Errorf("marshal body: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		h.orderServiceURL+"/internal/orders",
-		bytes.NewReader(payload),
-	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -307,7 +396,7 @@ func (h *Handler) callOrderService(ctx context.Context, body map[string]any) (ma
 
 	if resp.StatusCode != http.StatusCreated {
 		errBody, _ := io.ReadAll(resp.Body)
-		span.SetStatus(codes.Error, "non-201 response from order-service")
+		span.SetStatus(codes.Error, fmt.Sprintf("order-service returned HTTP %d", resp.StatusCode))
 		return nil, fmt.Errorf("order-service returned HTTP %d: %s", resp.StatusCode, errBody)
 	}
 
@@ -320,6 +409,9 @@ func (h *Handler) callOrderService(ctx context.Context, body map[string]any) (ma
 	if err := json.Unmarshal(data, &result); err != nil {
 		return nil, fmt.Errorf("decode response: %w", err)
 	}
-
 	return result, nil
+}
+
+func ms(start time.Time) float64 {
+	return float64(time.Since(start).Milliseconds())
 }

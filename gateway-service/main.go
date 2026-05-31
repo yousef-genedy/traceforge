@@ -1,9 +1,9 @@
-// gateway-service is the single public entry point for the OTel PoC.
+// gateway-service is the single public entry point for the TraceForge platform.
 //
-// It demonstrates:
-//   - OTel SDK initialisation (TracerProvider + MeterProvider)
-//   - otelgin middleware for automatic HTTP server instrumentation
-//   - Graceful shutdown that flushes buffered spans before exit
+// It demonstrates all three OTel signal pillars:
+//   - Traces  → OTel Collector → Jaeger
+//   - Metrics → Prometheus scrape endpoint → Prometheus → Grafana
+//   - Logs    → OTel Collector → Loki (with trace_id/span_id correlation)
 package main
 
 import (
@@ -20,16 +20,15 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/github.com/gin-gonic/gin/otelgin"
 
 	"gateway-service/handlers"
+	"gateway-service/internal/logging"
 	"gateway-service/internal/telemetry"
 )
 
 func main() {
-	// Structured JSON logging — log entries include trace_id/span_id when
-	// the context carries an active span (added manually or via middleware).
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	// Bootstrap logger before OTel is available (startup errors need somewhere to go).
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(logger)
+	})))
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
@@ -38,26 +37,24 @@ func main() {
 	port := env("SERVICE_PORT", "8080")
 	otlpEndpoint := env("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
 
-	// ── Initialise OpenTelemetry ────────────────────────────────────────────
-	// This must happen before any tracer/meter is obtained. It sets up the
-	// global TracerProvider, MeterProvider, and TextMapPropagator.
+	// ── Initialise OpenTelemetry (traces + metrics + logs) ──────────────────────
 	prov, err := telemetry.Init(ctx, serviceName, otlpEndpoint)
 	if err != nil {
 		slog.Error("failed to initialise telemetry", "error", err)
 		os.Exit(1)
 	}
 
-	// ── Gin router ──────────────────────────────────────────────────────────
+	// Replace bootstrap logger with the production logger that:
+	//   • emits JSON to stdout with trace_id/span_id injected from context
+	//   • exports records via OTLP → Collector → Loki
+	slog.SetDefault(logging.NewLogger(serviceName))
+	slog.Info("telemetry initialised", "service", serviceName, "otlp_endpoint", otlpEndpoint)
+
+	// ── Gin router ───────────────────────────────────────────────────────────────
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-
-	// gin.Recovery() catches panics and returns 500 (avoiding crashes).
 	r.Use(gin.Recovery())
-
-	// otelgin.Middleware creates a server span for every incoming HTTP
-	// request. The span name is "<METHOD> <route pattern>".
-	// It also extracts the "traceparent" header from inbound requests so
-	// that a caller's trace context is continued (not forked).
+	// otelgin creates a server span per request and extracts inbound traceparent.
 	r.Use(otelgin.Middleware(serviceName))
 
 	h := handlers.New(
@@ -68,18 +65,15 @@ func main() {
 	r.GET("/health", h.Health)
 	r.GET("/users/:id", h.GetUser)
 	r.POST("/orders", h.CreateOrder)
-
-	// The prometheus exporter (initialised inside telemetry.Init) registers
-	// all OTel metric instruments with the default prometheus registry.
-	// promhttp.Handler() exposes them in the standard text/plain format.
+	r.GET("/orders", h.GetOrdersByUser)
 	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
-	// ── HTTP server ─────────────────────────────────────────────────────────
+	// ── HTTP server ──────────────────────────────────────────────────────────────
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      r,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
 
@@ -91,20 +85,17 @@ func main() {
 		}
 	}()
 
-	// Block until SIGINT/SIGTERM.
 	<-ctx.Done()
 	slog.Info("shutdown signal received")
 
-	// ── Graceful shutdown ────────────────────────────────────────────────────
-	// Give in-flight requests 10 seconds to complete, then flush OTel buffers.
-	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// ── Graceful shutdown ────────────────────────────────────────────────────────
+	shutCtx, shutCancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer shutCancel()
 
 	if err := srv.Shutdown(shutCtx); err != nil {
 		slog.Error("HTTP server shutdown error", "error", err)
 	}
-
-	// Flush buffered spans — without this, the last few spans may be lost.
+	// Flush buffered spans, metrics, and log records before exit.
 	if err := prov.Shutdown(shutCtx); err != nil {
 		slog.Error("telemetry shutdown error", "error", err)
 	}

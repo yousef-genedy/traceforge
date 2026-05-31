@@ -1,5 +1,5 @@
-// order-service creates orders in PostgreSQL.
-// It demonstrates DB instrumentation: manual OTel spans around SQL queries.
+// order-service creates and manages orders in PostgreSQL.
+// Demonstrates DB span instrumentation, inventory checks, and payment simulation.
 package main
 
 import (
@@ -17,6 +17,7 @@ import (
 
 	"order-service/handlers"
 	"order-service/internal/db"
+	"order-service/internal/logging"
 	"order-service/internal/telemetry"
 )
 
@@ -36,7 +37,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// ── Database connection ─────────────────────────────────────────────────
+	slog.SetDefault(logging.NewLogger(serviceName))
+	slog.Info("telemetry initialised", "service", serviceName)
+
+	// ── Database connection ──────────────────────────────────────────────────────
 	database, err := db.New(ctx, db.Config{
 		Host:     env("DB_HOST", "localhost"),
 		Port:     env("DB_PORT", "5432"),
@@ -50,7 +54,7 @@ func main() {
 	}
 	defer database.Close()
 
-	// ── Gin router ──────────────────────────────────────────────────────────
+	// ── Gin router ───────────────────────────────────────────────────────────────
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
@@ -66,8 +70,9 @@ func main() {
 	srv := &http.Server{
 		Addr:         ":" + port,
 		Handler:      r,
-		ReadTimeout:  30 * time.Second, // longer for slow-query simulation
+		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	go func() {
