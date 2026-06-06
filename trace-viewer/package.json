@@ -1,0 +1,29 @@
+{
+  "name": "trace-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build"
+  },
+  "dependencies": {
+    "@grafana/data": "^11.6.0",
+    "@grafana/runtime": "^11.6.0",
+    "@grafana/scenes-react": "^8.3.0",
+    "@grafana/schema": "^11.6.0",
+    "@grafana/ui": "^11.6.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^6.28.0",
+    "rxjs": "^7.8.1"
+  },
+  "devDependencies": {
+    "@types/history": "^4.7.11",
+    "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.10"
+  }
+}
